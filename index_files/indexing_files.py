@@ -7,13 +7,14 @@ from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
 from sentence_transformers import SentenceTransformer
 import os
+import re
 from PyPDF2 import PdfFileReader 
 
 MODEL_NAME = "ricardo-filho/bert-base-portuguese-cased-nli-assin-2"
 
 def get_emb(inputs_list,model_name,max_length=512):
     model = SentenceTransformer(model_name, device='cuda')
-    return model.encode(inputs_list)
+    return model.encode(inputs_list).tolist()
 
 def create_document(doc, emb, index_name):
     return {
@@ -24,7 +25,7 @@ def create_document(doc, emb, index_name):
         'text_vector': emb
     }
 
-def load_dataset_from_pdf_files(file_path = 'pdf_files'):
+def load_dataset_from_pdf_files(file_path = '../pdf_files'):
     docs = []
     for file in os.listdir(file_path):
         pdfFileObj = open(file_path + '/' + file, 'rb')
@@ -33,9 +34,10 @@ def load_dataset_from_pdf_files(file_path = 'pdf_files'):
         for count in range(num_pages):
             pageObj = pdfReader.getPage(count)
             text = pageObj.extractText()
+            text = re.sub(' +', ' ', text) # replace multiple spaces with single space
             doc = {
-                'title': file.replace('.pdf',''),
-                'text': text
+                'title': f"{file.replace('.pdf','')}_page_{count}",
+                'text': text.replace('\n','').strip()
             }
             docs.append(doc)
     return docs
@@ -51,31 +53,37 @@ def bulk_predict(docs, model_name,batch_size=256):
 
 
 def load_dataset(path):
-    with open(path) as f:
-        return [json.loads(line) for line in f]
+    with open(path, encoding='utf8') as f:
+        return json.loads(f.read()) 
 
 
 def main(args):
     # create docoments
-    print("loading data from mysql....")
-    docs = load_dataset_from_pdf_files()
-    print("creating documents...")
-    with open(args.data, 'w') as f:
-        for doc, emb in zip(docs, bulk_predict(docs,model_name=MODEL_NAME)):
-            d = create_document(doc, emb, args.index_name)
-            f.write(json.dumps(d) + '\n')
+    if os.path.exists(args.data):
+        print("data already exists, skipping...")
+    else:
+        print("loading data from pdf....")
+        docs = load_dataset_from_pdf_files()
+        print("creating documents...")
+        json_docs = []
+        with open(args.data, 'w', encoding='utf8') as f:
+            for doc, emb in zip(docs, bulk_predict(docs,model_name=MODEL_NAME)):
+                d = create_document(doc, emb, args.index_name)
+                json_docs.append(d)
+            f.write(json.dumps(json_docs, ensure_ascii=False, indent=4))
 
     # create index
     print("creating index in elasticsearch...")
-    client = Elasticsearch()
-    client.indices.delete(index=args.index_name, ignore=[404])
-    with open(args.index_file) as index_file:
+    client = Elasticsearch("http://127.0.0.1:9200", verify_certs=False)
+    client.indices.delete(index=args.index_name)
+    with open(args.index_file, encoding='utf8') as index_file:
         source = index_file.read().strip()
-        client.indices.create(index=args.index_name, body=source)
+        mapping = json.loads(source)
+        client.indices.create(index=args.index_name, body=mapping)
 
     #index documents
     print("index documents...")
-    client = Elasticsearch()
+    client = Elasticsearch("http://127.0.0.1:9200", verify_certs=False)
     docs = load_dataset(args.data)
     bulk(client, docs)
 
